@@ -1,0 +1,18 @@
+{
+    "website_url": "http://localhost:8000",
+    "check_interval_minutes": 30,
+    "download_check_interval_minutes": 10,
+    "folders_to_monitor": [
+        {
+            "path": "C:/Video",
+            "additional_args": "--low-vram --disable-amp --depth-model Any_V2_S"
+        },
+        {
+            "path": "C:/Video2",
+            "additional_args": "--low-vram --disable-amp --depth-model Any_V2_S"
+        }
+    ],
+    "history_file": "upload_history.json",
+    "max_retries": 5,
+    "retry_delay": 10
+}
