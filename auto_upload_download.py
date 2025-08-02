@@ -7,9 +7,20 @@ from datetime import datetime
 from pathlib import Path
 import schedule
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urljoin, quote
+from urllib3.util.retry import Retry
 import re
+import sys
+import io
 
+# 强制 stdout 和 stderr 使用 UTF-8 编码
+if sys.stdout:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr:
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# 同时设置环境变量（可选）
+os.environ['PYTHONIOENCODING'] = 'utf-8'
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -138,7 +149,7 @@ class AutoUploadDownload:
         return False
     
     def find_new_videos(self):
-        """查找新的视频文件"""
+        """查找新的视频文件（仅限监控文件夹根目录，不递归）"""
         new_videos = []
         
         for folder_info in self.config['folders_to_monitor']:
@@ -151,174 +162,349 @@ class AutoUploadDownload:
                 # 支持的视频格式
                 video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm'}
                 
-                for root, dirs, files in os.walk(folder_path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        file_ext = os.path.splitext(file.lower())[1]
-                        
-                        if file_ext in video_extensions:
-                            # 检查文件是否已经处理过
-                            if not self.is_file_processed(file_path):
-                                new_videos.append({
-                                    'path': file_path,
-                                    'folder_info': folder_info,
-                                    'target_folder': os.path.dirname(file_path)  # 目标文件夹是原文件夹
-                                })
-                            else:
-                                logger.debug(f"跳过已处理的文件: {file_path}")
-                                
+                # ---  关键修改：只遍历根目录，不递归 ---
+                # 方法一：使用 os.scandir() (推荐，效率高)
+                with os.scandir(folder_path) as entries:
+                    for entry in entries:
+                        # 只处理文件，忽略目录
+                        if entry.is_file():
+                            file_ext = os.path.splitext(entry.name.lower())[1]
+                            if file_ext in video_extensions:
+                                file_path = entry.path # entry.path 包含完整路径
+                                # 检查文件是否已经处理过
+                                if not self.is_file_processed(file_path):
+                                    new_videos.append({
+                                        'path': file_path,
+                                        'folder_info': folder_info,
+                                        'target_folder': os.path.dirname(file_path)  # 目标文件夹是原文件夹
+                                    })
+                                else:
+                                    logger.debug(f"跳过已处理的文件: {file_path}")
+
             except Exception as e:
                 logger.error(f"扫描文件夹失败 {folder_path}: {e}")
         
         return new_videos
     
     def upload_video(self, video_path, additional_args, target_folder):
-        """上传视频到网站"""
+        """使用分块上传方式上传大视频文件，适配当前后端 session_id 机制"""
         session = requests.Session()
         
-        # 确保目标VR文件夹存在
+        # 确保目标VR文件夹存在 (如果您的脚本逻辑还需要这个)
         vr_folder = os.path.join(target_folder, 'VR')
         os.makedirs(vr_folder, exist_ok=True)
         
-        # 准备上传
-        files = {'file': open(video_path, 'rb')}
-        data = {'additional_args': additional_args}
-        
-        # 获取文件名（保留原始文件名）
         filename = os.path.basename(video_path)
+        file_size = os.path.getsize(video_path)
+        chunk_size = 10 * 1024 * 1024  # 10MB 每块（可配置）
+        total_chunks = (file_size // chunk_size) + (1 if file_size % chunk_size else 0)
         
-        for attempt in range(self.config['max_retries']):
-            try:
-                logger.info(f"尝试上传文件 (第{attempt+1}次): {filename}")
-                
-                response = session.post(
-                    f"{self.config['website_url']}/",
-                    files=files,
-                    data=data,
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    # 检查是否上传成功（可以通过检查响应内容判断）
-                    if '上传并转换' in response.text or 'file' in response.text.lower():
-                        logger.info(f"上传成功: {filename}")
+        logger.info(f"准备上传大文件: {filename}")
+        logger.info(f"大小: {file_size / (1024*1024):.1f}MB | 分块数: {total_chunks} | 块大小: {chunk_size / 1024:.1f}KB")
+        
+        # === 分块上传逻辑开始 ===
+        # 🟡 关键：初始化 session_id 为 None，首次上传时不会发送
+        current_session_id = None 
+        
+        try:
+            with open(video_path, 'rb') as f:
+                for chunk_index in range(total_chunks):
+                    # 计算当前块
+                    f.seek(chunk_index * chunk_size)
+                    chunk_data = f.read(chunk_size)
+                    
+                    # 准备分块数据
+                    files = {
+                        'chunk': ('chunk', chunk_data) # 文件块数据
+                    }
+                    data = {
+                        'filename': filename,
+                        'chunk_index': chunk_index,
+                        'total_chunks': total_chunks,
+                        'additional_args': additional_args
+                        # 'session_id': current_session_id # 在下面的条件中添加
+                    }
+                    
+                    # 🟡 关键：如果已有 session_id，则添加到 data 中
+                    if current_session_id is not None:
+                        data['session_id'] = current_session_id
+                    
+                    # 带重试的上传
+                    for attempt in range(self.config['max_retries']):
+                        try:
+                            logger.debug(f"上传块 {chunk_index + 1}/{total_chunks} (尝试 {attempt + 1})")
+                            
+                            response = session.post(
+                                f"{self.config['website_url']}/upload",  # 使用 /upload 接口
+                                files=files,
+                                data=data,
+                                timeout=300  # 每块上传超时5分钟
+                            )
+                            
+                            if response.status_code == 200:
+                                try:
+                                    result = response.json()
+                                except requests.exceptions.JSONDecodeError as e:
+                                    logger.error(f"解析服务器响应失败 (HTTP 200): {e}")
+                                    logger.error(f"响应内容: {response.text}")
+                                    # 如果解析失败，本次尝试视为失败，进行重试
+                                    continue # 跳出本次 attempt 的成功处理，进入下一次重试或循环
+
+                                # 🟡 关键：检查响应是否包含新的 session_id (首次上传或后续上传都会返回)
+                                if 'session_id' in result:
+                                    # 🟡 关键：更新当前的 session_id，用于下一次上传
+                                    # 即使是第一次，也会从服务器获取到新的 session_id
+                                    current_session_id = result['session_id']
+                                    logger.debug(f"获取/更新 session_id: {current_session_id}")
+
+                                # 🟡 关键：检查是否是最终的合并成功消息
+                                if result.get('message') == '上传并合并完成，已加入转换队列':
+                                    logger.info(f" 文件 '{filename}' 上传、合并成功，并已加入转换队列！")
+                                    # 🟡 关键：记录到历史（状态为 uploaded）
+                                    file_hash = self.get_file_hash(video_path)
+                                    self.history['uploaded_files'][video_path] = {
+                                        'uploaded_at': datetime.now().isoformat(),
+                                        'url': self.config['website_url'],
+                                        'additional_args': additional_args,
+                                        'target_folder': target_folder,
+                                        'file_hash': file_hash,
+                                        'status': 'uploaded', # 等待 check_conversion_status 下载
+                                        # 可选：存储 session_id 以便后续追踪
+                                        'session_id': current_session_id 
+                                    }
+                                    self.save_history()
+                                    return True # 上传和合并成功，直接返回
+
+                                # 如果不是最终成功，但块上传成功 (例如 '块 X/Y 上传成功')
+                                if 'message' in result and ('上传成功' in result['message'] or '上传完成' in result['message']):
+                                    logger.info(f" 块 {chunk_index + 1}/{total_chunks} 上传成功: {result.get('message', 'OK')}")
+                                    break # 成功，跳出重试循环，处理下一个块
+                                else:
+                                    # 服务器返回了 200 但消息不是预期的成功，视为失败
+                                    logger.warning(f" 块 {chunk_index} 上传未成功 (HTTP 200 但消息异常): {result}")
+                                    
+                            else:
+                                logger.warning(f" 块 {chunk_index} 上传失败 (HTTP {response.status_code}): {response.text}")
+                                
+                        except Exception as e:
+                            logger.warning(f" 块 {chunk_index} 上传异常 (尝试 {attempt + 1}): {e}")
                         
-                        # 记录到历史
-                        file_hash = self.get_file_hash(video_path)
-                        self.history['uploaded_files'][video_path] = {
-                            'uploaded_at': datetime.now().isoformat(),
-                            'url': self.config['website_url'],
-                            'additional_args': additional_args,
-                            'target_folder': target_folder,
-                            'file_hash': file_hash,
-                            'status': 'uploaded'
-                        }
-                        self.save_history()
-                        
-                        files['file'].close()
-                        return True
+                        # 重试前等待
+                        if attempt < self.config['max_retries'] - 1:
+                            time.sleep(self.config['retry_delay'])
                     else:
-                        logger.warning(f"上传响应异常: {response.status_code}")
-                        
-            except Exception as e:
-                logger.error(f"上传失败 (第{attempt+1}次): {filename}, 错误: {e}")
-                if attempt < self.config['max_retries'] - 1:
-                    logger.info(f"等待 {self.config['retry_delay']} 秒后重试...")
-                    time.sleep(self.config['retry_delay'])
-            
-            # 重新打开文件（如果需要重试）
-            if attempt < self.config['max_retries'] - 1:
-                try:
-                    files['file'].close()
-                    files['file'] = open(video_path, 'rb')
-                except:
-                    pass
-        
-        logger.error(f"上传失败达到最大重试次数: {filename}")
-        files['file'].close()
-        return False
-    
-    def check_conversion_status(self):
-        """检查转换状态并下载完成的文件"""
-        session = requests.Session()
-        
-        try:
-            # 获取网站状态
-            status_response = session.get(f"{self.config['website_url']}/", timeout=10)
-            if status_response.status_code != 200:
-                logger.warning(f"无法获取网站状态: {status_response.status_code}")
-                return
-            
-            # 解析HTML获取已转换的文件列表
-            # 这里需要根据您的网站HTML结构调整
-            converted_files = []
-            
-            # 简单的HTML解析（可以根据需要改进）
-            import re
-            # 查找转换完成的文件链接
-            pattern = r'<a href="[^"]*/download/([^"]+)"[^>]*>下载</a>'
-            matches = re.findall(pattern, status_response.text)
-            
-            for filename in matches:
-                # URL解码
-                import urllib.parse
-                decoded_filename = urllib.parse.unquote(filename)
+                        # 所有重试均失败
+                        logger.error(f" 块 {chunk_index} 达到最大重试次数，上传中断")
+                        return False  # 整体上传失败
                 
-                # 在历史记录中查找对应的上传文件
-                for uploaded_path, info in self.history['uploaded_files'].items():
-                    if (info['status'] == 'uploaded' and 
-                        os.path.basename(uploaded_path) == decoded_filename):
-                        
-                        # 下载文件
-                        if self.download_converted_file(decoded_filename, info['target_folder']):
-                            # 更新历史记录
-                            info['status'] = 'downloaded'
-                            info['downloaded_at'] = datetime.now().isoformat()
-                            
-                            self.history['downloaded_files'][uploaded_path] = {
-                                'downloaded_at': datetime.now().isoformat(),
-                                'target_folder': info['target_folder'],
-                                'original_filename': decoded_filename
-                            }
-                            
-                            logger.info(f"文件已下载并记录: {decoded_filename}")
-            
-            self.save_history()
-            
-        except Exception as e:
-            logger.error(f"检查转换状态失败: {e}")
-    
-    def download_converted_file(self, filename, target_folder):
-        """下载转换完成的文件"""
-        session = requests.Session()
-        
-        try:
-            # 构建下载URL
-            download_url = f"{self.config['website_url']}/download/{filename}"
-            
-            # 确保VR文件夹存在
-            vr_folder = os.path.join(target_folder, 'VR')
-            os.makedirs(vr_folder, exist_ok=True)
-            
-            # 下载文件
-            response = session.get(download_url, stream=True, timeout=30)
-            if response.status_code == 200:
-                # 构建目标文件路径
-                target_path = os.path.join(vr_folder, filename)
-                
-                # 保存文件
-                with open(target_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                
-                logger.info(f"下载成功: {target_path}")
-                return True
-            else:
-                logger.error(f"下载失败: {filename}, 状态码: {response.status_code}")
+                # === 注意：正常情况下，循环结束前应该因为最终成功消息而 return True ===
+                # 如果代码执行到这里，意味着所有分块都上传了，但没有收到最终的合并成功消息
+                # 这通常不应该发生，可能是网络问题导致最后的响应没收到
+                logger.warning(f"所有 {total_chunks} 个分块上传完成，但未收到最终合并成功确认。可能需要手动检查或重试。")
+                # 您可以选择在这里返回 False，或者尝试添加一个逻辑去轮询状态
+                # 但根据现有后端逻辑，这应该很少见。
                 return False
                 
         except Exception as e:
-            logger.error(f"下载文件失败 {filename}: {e}")
+            logger.error(f"分块上传过程中发生严重错误 {filename}: {e}")
+            return False
+    
+    def check_conversion_status(self):
+        """检查转换状态并下载完成的文件（适配新版网站 API - 返回字符串列表）"""
+        session = requests.Session()
+        
+        try:
+            api_url = f"{self.config['website_url']}/api/status"
+            logger.debug(f"请求状态接口: {api_url}")
+            
+            response = session.get(api_url, timeout=10)
+            if response.status_code != 200:
+                logger.warning(f"获取状态失败: {response.status_code} - {response.text}")
+                return
+            
+            try:
+                data = response.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"响应不是有效的JSON: {e}")
+                return
+
+            # 提取已转换文件列表
+            # 关键：后端返回的是字符串列表，如 ["file1.mp4", "file2.mp4"]
+            converted_files = data.get('converted_files', [])
+            if not converted_files:
+                logger.info("暂无已转换的文件。")
+                return
+
+            logger.info(f"发现 {len(converted_files)} 个已转换文件: {converted_files}")
+
+            # 关键：直接遍历字符串列表中的文件名
+            for filename in converted_files:
+                # 确保文件名存在且不为空
+                if not filename or not isinstance(filename, str):
+                    continue
+
+                # 在上传历史中查找匹配的原始文件
+                matched = False
+                for uploaded_path, info in self.history['uploaded_files'].items():
+                    # 检查状态为 'uploaded' 且原始文件名匹配
+                    if (info.get('status') == 'uploaded' and 
+                        os.path.basename(uploaded_path) == filename):
+                        
+                        # 找到匹配，开始下载
+                        if self.download_converted_file(session, filename, info['target_folder']):
+                            # 更新上传历史中的状态
+                            info['status'] = 'downloaded'
+                            info['downloaded_at'] = datetime.now().isoformat()
+                            
+                            # 将信息添加到下载历史
+                            self.history['downloaded_files'][uploaded_path] = {
+                                'downloaded_at': datetime.now().isoformat(),
+                                'target_folder': info['target_folder'],
+                                'original_filename': filename
+                            }
+                            logger.info(f"文件已下载并记录: {filename}")
+                        
+                        matched = True
+                        break # 找到匹配项后跳出循环
+
+                if not matched:
+                    logger.warning(f"未找到上传记录的已转换文件: {filename}")
+
+            # 保存更新后的历史记录
+            self.save_history()
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"请求网站状态时发生网络错误: {e}")
+        except Exception as e:
+            logger.error(f"检查转换状态时发生未知错误: {e}")
+    
+    def download_converted_file(self, session, filename, target_folder):
+        """
+        下载转换完成的文件，支持断点续传 (Resume)
+        """
+        try:
+            encoded_filename = quote(filename, safe='')
+            download_url = f"{self.config['website_url']}/download/{encoded_filename}"
+            
+            vr_folder = os.path.join(target_folder, 'VR')
+            os.makedirs(vr_folder, exist_ok=True)
+            target_path = os.path.join(vr_folder, filename)
+            
+            logger.info(f"开始下载: {filename} -> {target_path}")
+            
+            # --- 断点续传逻辑 ---
+            resume_byte_pos = 0
+            if os.path.exists(target_path):
+                resume_byte_pos = os.path.getsize(target_path)
+                if resume_byte_pos > 0:
+                    logger.info(f"检测到部分下载的文件，大小: {resume_byte_pos} 字节，尝试续传...")
+                else:
+                    logger.info(f"检测到空文件，重新开始下载...")
+                    resume_byte_pos = 0 # 0字节文件也当新文件处理
+
+            # --- 重试配置 ---
+            max_retries = self.config.get('max_download_retries', 3)
+            retry_strategy = Retry(
+                total=max_retries,
+                backoff_factor=1, # 重试间隔会指数增长 (1, 2, 4, 8... 秒)
+                status_forcelist=[429, 500, 502, 503, 504], # 对这些状态码重试
+                allowed_methods=["HEAD", "GET"] # 允许重试的HTTP方法
+            )
+            # 为这个 session 配置重试 (可选，也可以在循环内手动重试)
+            # adapter = HTTPAdapter(max_retries=retry_strategy)
+            # session.mount("http://", adapter)
+            # session.mount("https://", adapter)
+
+            for attempt in range(max_retries + 1):
+                try:
+                    # --- 构建带 Range 头的请求 ---
+                    headers = {}
+                    if resume_byte_pos > 0:
+                        # 请求从 resume_byte_pos 开始到文件末尾
+                        headers['Range'] = f'bytes={resume_byte_pos}-'
+                    
+                    # 使用更长的读取超时
+                    response = session.get(download_url, headers=headers, stream=True, timeout=(30, 7200),allow_redirects=True)
+
+                    # --- 处理响应 ---
+                    if response.status_code == 200:
+                        # 服务器不支持 Range，返回了整个文件
+                        # 如果 resume_byte_pos > 0，说明我们预期续传，但服务器没支持，需要重新开始
+                        if resume_byte_pos > 0:
+                            logger.warning("服务器不支持 Range 请求，将重新开始下载。")
+                            # 删除部分文件，重新下载
+                            os.remove(target_path)
+                            resume_byte_pos = 0
+                            # 注意：这里需要 continue 到循环开头，重新发起不带 Range 的请求
+                            # 但为避免无限循环，我们简单处理：记录警告，然后覆盖写入（相当于重新开始）
+                            # 更好的做法是 break 并让下一次 run_once 重新开始
+                            logger.info("将覆盖现有文件重新下载。")
+                        # 以写入模式 ('wb') 打开，覆盖或创建新文件
+                        file_mode = 'wb'
+                        expected_status = 200
+                    elif response.status_code == 206:
+                        # 服务器支持 Range，成功返回部分内容
+                        if resume_byte_pos == 0:
+                            logger.warning("收到 206 状态码但未请求 Range，行为异常。")
+                            # 可能还是当完整文件处理？
+                            file_mode = 'wb'
+                        else:
+                            # 正常续传情况
+                            file_mode = 'ab' # 追加模式
+                        expected_status = 206
+                    else:
+                        logger.error(f"下载失败 (HTTP {response.status_code}): {filename}")
+                        if 400 <= response.status_code < 500:
+                            return False # 客户端错误，重试无意义
+                        if attempt < max_retries:
+                            logger.warning(f"HTTP 错误，准备重试...")
+                            time.sleep(self.config.get('retry_delay', 10))
+                            continue
+                        else:
+                            return False
+
+                    # --- 流式写入文件 ---
+                    # 检查状态码是否符合预期
+                    if response.status_code != expected_status:
+                        logger.error(f"预期状态码 {expected_status}，实际为 {response.status_code}")
+                        if attempt < max_retries:
+                            time.sleep(self.config.get('retry_delay', 10))
+                            continue
+                        else:
+                            return False
+
+                    # 以正确模式打开文件
+                    with open(target_path, file_mode) as f:
+                        bytes_downloaded = 0
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                bytes_downloaded += len(chunk)
+                    
+                    # --- 验证下载完整性 ---
+                    # 理论上，对于 200，应该下载完整文件；对于 206，应该下载了请求的范围
+                    # 这里简化处理：只要没有异常，就认为成功
+                    logger.info(f"下载完成: {filename} (本次传输 {bytes_downloaded} 字节)")
+                    return True # 下载成功
+
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"请求异常 (下载 {filename}) (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+                    if attempt < max_retries:
+                        time.sleep(self.config.get('retry_delay', 10))
+                    else:
+                        logger.error(f"下载 {filename} 达到最大重试次数，失败。")
+                        return False
+                except OSError as e:
+                    logger.error(f"文件系统错误 (下载 {filename}): {e}")
+                    return False
+                except Exception as e:
+                    logger.error(f"下载文件失败 {filename}: {e}")
+                    return False
+
+            return False # 所有尝试都失败
+                
+        except Exception as e:
+            logger.error(f"下载文件 {filename} 发生未知错误: {e}")
             return False
     
     def run_once(self):
