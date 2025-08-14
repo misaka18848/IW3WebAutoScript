@@ -12,7 +12,7 @@ from urllib3.util.retry import Retry
 import re
 import sys
 import io
-
+import subprocess
 # 强制 stdout 和 stderr 使用 UTF-8 编码
 if sys.stdout:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -317,7 +317,7 @@ class AutoUploadDownload:
             api_url = f"{self.config['website_url']}/api/status"
             logger.debug(f"请求状态接口: {api_url}")
             
-            response = session.get(api_url, timeout=10)
+            response = session.get(api_url, timeout=20)
             if response.status_code != 200:
                 logger.warning(f"获取状态失败: {response.status_code} - {response.text}")
                 return
@@ -380,7 +380,8 @@ class AutoUploadDownload:
     
     def download_converted_file(self, session, filename, target_folder):
         """
-        下载转换完成的文件，支持断点续传 (Resume)
+        下载转换完成的文件，支持断点续传，并提取原始视频内封字幕。
+        假设服务端不修改文件名，原始视频位于 target_folder 根目录。
         """
         try:
             encoded_filename = quote(filename, safe='')
@@ -400,62 +401,35 @@ class AutoUploadDownload:
                     logger.info(f"检测到部分下载的文件，大小: {resume_byte_pos} 字节，尝试续传...")
                 else:
                     logger.info(f"检测到空文件，重新开始下载...")
-                    resume_byte_pos = 0 # 0字节文件也当新文件处理
+                    resume_byte_pos = 0
 
-            # --- 重试配置 ---
             max_retries = self.config.get('max_download_retries', 3)
-            retry_strategy = Retry(
-                total=max_retries,
-                backoff_factor=1, # 重试间隔会指数增长 (1, 2, 4, 8... 秒)
-                status_forcelist=[429, 500, 502, 503, 504], # 对这些状态码重试
-                allowed_methods=["HEAD", "GET"] # 允许重试的HTTP方法
-            )
-            # 为这个 session 配置重试 (可选，也可以在循环内手动重试)
-            # adapter = HTTPAdapter(max_retries=retry_strategy)
-            # session.mount("http://", adapter)
-            # session.mount("https://", adapter)
 
             for attempt in range(max_retries + 1):
                 try:
-                    # --- 构建带 Range 头的请求 ---
                     headers = {}
                     if resume_byte_pos > 0:
-                        # 请求从 resume_byte_pos 开始到文件末尾
                         headers['Range'] = f'bytes={resume_byte_pos}-'
                     
-                    # 使用更长的读取超时
-                    response = session.get(download_url, headers=headers, stream=True, timeout=(30, 7200),allow_redirects=True)
+                    response = session.get(download_url, headers=headers, stream=True, timeout=(30, 7200), allow_redirects=True)
 
-                    # --- 处理响应 ---
                     if response.status_code == 200:
-                        # 服务器不支持 Range，返回了整个文件
-                        # 如果 resume_byte_pos > 0，说明我们预期续传，但服务器没支持，需要重新开始
                         if resume_byte_pos > 0:
                             logger.warning("服务器不支持 Range 请求，将重新开始下载。")
-                            # 删除部分文件，重新下载
                             os.remove(target_path)
                             resume_byte_pos = 0
-                            # 注意：这里需要 continue 到循环开头，重新发起不带 Range 的请求
-                            # 但为避免无限循环，我们简单处理：记录警告，然后覆盖写入（相当于重新开始）
-                            # 更好的做法是 break 并让下一次 run_once 重新开始
                             logger.info("将覆盖现有文件重新下载。")
-                        # 以写入模式 ('wb') 打开，覆盖或创建新文件
                         file_mode = 'wb'
                         expected_status = 200
                     elif response.status_code == 206:
-                        # 服务器支持 Range，成功返回部分内容
                         if resume_byte_pos == 0:
                             logger.warning("收到 206 状态码但未请求 Range，行为异常。")
-                            # 可能还是当完整文件处理？
-                            file_mode = 'wb'
-                        else:
-                            # 正常续传情况
-                            file_mode = 'ab' # 追加模式
+                        file_mode = 'ab'
                         expected_status = 206
                     else:
                         logger.error(f"下载失败 (HTTP {response.status_code}): {filename}")
                         if 400 <= response.status_code < 500:
-                            return False # 客户端错误，重试无意义
+                            return False
                         if attempt < max_retries:
                             logger.warning(f"HTTP 错误，准备重试...")
                             time.sleep(self.config.get('retry_delay', 10))
@@ -463,8 +437,6 @@ class AutoUploadDownload:
                         else:
                             return False
 
-                    # --- 流式写入文件 ---
-                    # 检查状态码是否符合预期
                     if response.status_code != expected_status:
                         logger.error(f"预期状态码 {expected_status}，实际为 {response.status_code}")
                         if attempt < max_retries:
@@ -473,7 +445,6 @@ class AutoUploadDownload:
                         else:
                             return False
 
-                    # 以正确模式打开文件
                     with open(target_path, file_mode) as f:
                         bytes_downloaded = 0
                         for chunk in response.iter_content(chunk_size=8192):
@@ -481,11 +452,80 @@ class AutoUploadDownload:
                                 f.write(chunk)
                                 bytes_downloaded += len(chunk)
                     
-                    # --- 验证下载完整性 ---
-                    # 理论上，对于 200，应该下载完整文件；对于 206，应该下载了请求的范围
-                    # 这里简化处理：只要没有异常，就认为成功
                     logger.info(f"下载完成: {filename} (本次传输 {bytes_downloaded} 字节)")
-                    return True # 下载成功
+                    
+                    # ✅✅✅ === 新增功能：提取原始视频内封字幕 ===
+                    # 1. 直接构建原始视频路径
+                    # 因为服务端不修改文件名，原始视频就在 target_folder 根目录下
+                    original_video_path = os.path.join(target_folder, filename)
+                    
+                    if not os.path.exists(original_video_path):
+                        logger.warning(f"原始视频文件不存在，无法提取字幕: {original_video_path}")
+                        return True  # 下载成功，字幕提取失败不影响主流程
+
+                    # 2. 构建 ffmpeg 路径
+                    script_dir = Path(__file__).parent
+                    ffmpeg_path = script_dir / "bin" / "ffmpeg.exe"
+                    if not ffmpeg_path.exists():
+                        logger.warning(f"ffmpeg 未找到: {ffmpeg_path}，跳过字幕提取")
+                        return True
+
+                    # 3. 使用 ffprobe 分析字幕流
+                    try:
+                        import subprocess
+                        cmd_probe = [
+                            str(ffmpeg_path), '-v', 'error', '-select_streams', 's', 
+                            '-show_entries', 'stream=index:stream=codec_type', 
+                            '-of', 'json', original_video_path
+                        ]
+                        result = subprocess.run(cmd_probe, capture_output=True, text=True, check=False)
+                        
+                        if result.returncode != 0:
+                            logger.debug(f"ffprobe 分析字幕流失败: {result.stderr}")
+                            return True
+
+                        try:
+                            streams_info = json.loads(result.stdout)
+                            text_subtitle_streams = []
+                            for stream in streams_info.get('streams', []):
+                                if (stream.get('codec_type') == 'subtitle' and 
+                                    stream.get('codec_name') in ['srt', 'ass', 'subrip', 'text']):
+                                    text_subtitle_streams.append(stream)
+                            
+                            if not text_subtitle_streams:
+                                logger.info(f"原始视频无内封文本字幕，跳过提取: {os.path.basename(original_video_path)}")
+                                return True
+
+                            # 提取第一个文本字幕流
+                            target_subtitle_path = os.path.join(vr_folder, f"{Path(filename).stem}.srt")
+                            if os.path.exists(target_subtitle_path):
+                                logger.info(f"字幕文件已存在，跳过提取: {target_subtitle_path}")
+                                return True
+
+                            stream_index = text_subtitle_streams[0]['index']
+                            cmd_extract = [
+                                str(ffmpeg_path), '-i', original_video_path, 
+                                '-map', f'0:{stream_index}', '-c:s', 'srt', 
+                                '-y', target_subtitle_path
+                            ]
+                            
+                            logger.info(f"正在提取字幕流 {stream_index} -> {target_subtitle_path}")
+                            result_extract = subprocess.run(cmd_extract, capture_output=True, text=True, check=False)
+                            
+                            if result_extract.returncode == 0:
+                                logger.info(f"✅ 字幕提取成功: {target_subtitle_path}")
+                            else:
+                                logger.warning(f"⚠️ 字幕提取失败 (ffmpeg): {result_extract.stderr}")
+                            
+                        except json.JSONDecodeError as e:
+                            logger.error(f"解析 ffprobe 输出失败: {e}")
+                            
+                    except Exception as e:
+                        logger.error(f"执行 ffmpeg 提取字幕时发生错误: {e}")
+                    
+                    # ✅✅✅ === 新增功能结束 ===
+                    
+                    return True
 
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"请求异常 (下载 {filename}) (尝试 {attempt + 1}/{max_retries + 1}): {e}")
@@ -501,7 +541,7 @@ class AutoUploadDownload:
                     logger.error(f"下载文件失败 {filename}: {e}")
                     return False
 
-            return False # 所有尝试都失败
+            return False
                 
         except Exception as e:
             logger.error(f"下载文件 {filename} 发生未知错误: {e}")

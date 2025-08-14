@@ -1,6 +1,6 @@
 # IW3WebAutoScript
 ## 简介
-配合IW3 Web GUI使用的自动化脚本。自动检测文件夹列表内新视频并将其上传至IW3 Web GUI中开始处理,处理完成后自动下载回原文件夹下的VR文件夹里,可以用于配合RSS订阅自动追番自动转换。如果你觉得这个项目帮到了你，欢迎在左上角点个star。
+配合IW3 Web GUI使用的自动化脚本。自动检测文件夹列表内新视频并将其上传至IW3 Web GUI中开始处理,处理完成后自动下载回原文件夹下的VR文件夹里,可以用于配合RSS订阅自动追番自动转换。如果你觉得这个项目帮到了你，欢迎在右上角点个star。
 ## 如何使用
 1.参考[此处](https://github.com/misaka18848/IW3-Web-GUI)部署IW3 Web GUI  
 2.安装Python  
@@ -44,7 +44,17 @@
 ```cmd
 pip install -r requirements.txt
 ```
-5.在项目文件夹里打开命令提示符，输入以下内容启动该脚本
+5.由于ffmpeg的许可证限制，本项目无法在仓库内置ffmpeg的可执行文件，故需要你自行从[此处](https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z)下载ffmpeg,解压后把bin文件夹和bin文件夹里面的文件放入项目文件夹里  
+这时你的文件目录结构应该像这样  
+```
+- AutoIW3Web/
+    - bin/
+        - ffmpeg.exe
+        - ffplay.exe
+        - ffprobe.exe
+    - 本项目文件（比如auto_upload_download.py auto_config.json等）
+``` 
+6.在项目文件夹里打开命令提示符，输入以下内容启动该脚本
 ```cmd
 python auto_upload_download.py
 ```
